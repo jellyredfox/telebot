@@ -30,6 +30,9 @@ class Storage:
                 PRIMARY KEY(attempt_id, position));
             CREATE TABLE IF NOT EXISTS group_output (
                 chat_id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS group_outputs_by_kind (
+                chat_id INTEGER NOT NULL, kind TEXT NOT NULL, message_id INTEGER NOT NULL,
+                PRIMARY KEY(chat_id, kind));
             CREATE TABLE IF NOT EXISTS private_context (
                 user_id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL REFERENCES quiz_groups(chat_id));
         ''')
@@ -107,13 +110,13 @@ class Storage:
             WHERE p.chat_id=? AND p.quiz_id=? AND p.finished=1 GROUP BY p.id
             ORDER BY points DESC, p.user_id ASC''', (chat_id, quiz_id)).fetchall()
 
-    def previous_output(self, chat_id):
-        row = self.db.execute('SELECT message_id FROM group_output WHERE chat_id=?', (chat_id,)).fetchone()
+    def previous_output(self, chat_id, kind):
+        row = self.db.execute('SELECT message_id FROM group_outputs_by_kind WHERE chat_id=? AND kind=?', (chat_id, kind)).fetchone()
         return row[0] if row else None
 
-    def remember_output(self, chat_id, message_id):
+    def remember_output(self, chat_id, kind, message_id):
         with self.db:
-            self.db.execute('INSERT INTO group_output VALUES (?,?) ON CONFLICT(chat_id) DO UPDATE SET message_id=excluded.message_id', (chat_id, message_id))
+            self.db.execute('INSERT INTO group_outputs_by_kind VALUES (?,?,?) ON CONFLICT(chat_id,kind) DO UPDATE SET message_id=excluded.message_id', (chat_id, kind, message_id))
 
     def close(self):
         self.db.close()

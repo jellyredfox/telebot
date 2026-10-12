@@ -127,34 +127,80 @@ class QuizTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.db.db.execute('SELECT status FROM games').fetchone()[0], 'finished')
         self.assertIsNotNone(self.db.get(self.attempt['id'], 7))
 
-    async def test_group_cleanup_survives_restart(self):
+    async def test_group_cleanup_survives_restart_and_keeps_other_kinds(self):
         message = self.message(chat_type='supergroup', chat_id=-1)
         await self.quiz.quiz(message)
-        self.assertEqual(self.db.previous_output(-1), 101)
         self.db.close()
         self.db = Storage(self.path)
         self.quiz = Quiz(self.bot, self.db, 'test_bot')
         message.answer.return_value = NS(message_id=102)
         await self.quiz.top(message)
-        self.bot.delete_message.assert_awaited_once_with(-1, 101)
-        self.assertEqual(self.db.previous_output(-1), 102)
-        self.assertIn('Пройти лично', message.answer.call_args.kwargs['reply_markup'].inline_keyboard[0][0].text)
+        self.bot.delete_message.assert_not_called()
+        message.answer.return_value = NS(message_id=103)
+        await self.quiz.top(message)
+        self.bot.delete_message.assert_awaited_once_with(-1, 102)
+        self.assertEqual(self.db.previous_output(-1, 'quiz'), 101)
+        self.assertEqual(self.db.previous_output(-1, 'top'), 103)
+        message.answer.return_value = NS(message_id=104)
+        await self.quiz.quiz(message)
+        self.bot.delete_message.assert_awaited_with(-1, 101)
+        self.assertEqual(self.db.previous_output(-1, 'quiz'), 104)
+        self.assertEqual(self.db.previous_output(-1, 'top'), 103)
 
     async def test_old_group_message_edit_fallback(self):
-        self.db.remember_output(-1, 100)
+        self.db.remember_output(-1, 'quiz', 100)
+        self.db.remember_output(-1, 'top', 200)
         self.bot.delete_message.side_effect = TelegramBadRequest(method=DeleteMessage(chat_id=-1,message_id=100), message="message can't be deleted")
         message = self.message(chat_type='supergroup', chat_id=-1)
         await self.quiz.quiz(message)
+        self.bot.delete_message.assert_awaited_once_with(-1, 100)
         self.bot.edit_message_text.assert_awaited_once()
+        self.assertEqual(self.bot.edit_message_text.call_args.kwargs['message_id'], 100)
         message.answer.assert_not_called()
-        self.assertEqual(self.db.previous_output(-1), 100)
+        self.assertEqual(self.db.previous_output(-1, 'quiz'), 100)
+        self.assertEqual(self.db.previous_output(-1, 'top'), 200)
 
-    async def test_concurrent_group_calls_leave_one_tracked_output(self):
+    async def test_concurrent_group_calls_keep_separate_outputs(self):
         message = self.message(chat_type='supergroup', chat_id=-1)
         message.answer.side_effect = [NS(message_id=201), NS(message_id=202)]
         await asyncio.gather(self.quiz.quiz(message), self.quiz.top(message))
-        self.bot.delete_message.assert_awaited_once_with(-1, 201)
-        self.assertEqual(self.db.previous_output(-1), 202)
+        self.bot.delete_message.assert_not_called()
+        self.assertEqual(self.db.previous_output(-1, 'quiz'), 201)
+        self.assertEqual(self.db.previous_output(-1, 'top'), 202)
+        message.answer.side_effect = [NS(message_id=203), NS(message_id=204)]
+        await asyncio.gather(self.quiz.top(message), self.quiz.top(message))
+        self.assertEqual([call.args for call in self.bot.delete_message.await_args_list], [(-1, 202), (-1, 203)])
+        self.assertEqual(self.db.previous_output(-1, 'quiz'), 201)
+        self.assertEqual(self.db.previous_output(-1, 'top'), 204)
+
+    async def test_help_stats_and_other_groups_do_not_replace_quiz_or_top(self):
+        self.db.remember_output(-1, 'quiz', 100)
+        self.db.remember_output(-1, 'top', 200)
+        message = self.message(chat_type='supergroup', chat_id=-1)
+        message.answer.side_effect = [NS(message_id=i) for i in (301,302,303,304)]
+        await self.quiz.help(message)
+        await self.quiz.stats(message)
+        self.bot.delete_message.assert_not_called()
+        await self.quiz.help(message)
+        await self.quiz.stats(message)
+        self.assertEqual([call.args for call in self.bot.delete_message.await_args_list], [(-1,301),(-1,302)])
+        other = self.message(chat_type='supergroup', chat_id=-2)
+        await self.quiz.top(other)
+        self.assertEqual(self.bot.delete_message.await_count, 2)
+        self.assertEqual(self.db.previous_output(-1, 'quiz'), 100)
+        self.assertEqual(self.db.previous_output(-1, 'top'), 200)
+
+    async def test_legacy_untyped_card_is_not_guessed_or_deleted(self):
+        with self.db.db:
+            self.db.db.execute('INSERT INTO group_output VALUES (?,?)', (-1, 999))
+        self.db.close()
+        self.db = Storage(self.path)
+        self.quiz = Quiz(self.bot, self.db, 'test_bot')
+        message = self.message(chat_type='supergroup', chat_id=-1)
+        await self.quiz.top(message)
+        self.bot.delete_message.assert_not_called()
+        self.assertEqual(self.db.db.execute('SELECT message_id FROM group_output WHERE chat_id=-1').fetchone()[0], 999)
+        self.assertEqual(self.db.attempt(-1,7)['questions'], self.attempt['questions'])
 
     async def test_names_and_no_author_before_answer(self):
         self.assertEqual(len(set(PARTICIPANTS.values())), 13)

@@ -45,13 +45,13 @@ class Quiz:
         return InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text='Пройти лично →', url=url)]])
 
-    async def respond(self, message, text, **kwargs):
+    async def respond(self, message, text, *, output_kind=None, **kwargs):
         if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
             return await message.answer(text, **kwargs)
         async with self.group_locks[message.chat.id]:
             group = self.store.group(message.chat.id, message.chat.title or 'Группа')
             kwargs.setdefault('reply_markup', self.invitation(group))
-            previous = self.store.previous_output(message.chat.id)
+            previous = self.store.previous_output(message.chat.id, output_kind) if output_kind else None
             if previous:
                 try:
                     await self.bot.delete_message(message.chat.id, previous)
@@ -68,11 +68,12 @@ class Quiz:
                                 return
                             logging.warning('Old group message could not be deleted or edited: %s', previous)
             sent = await message.answer(text, **kwargs)
-            self.store.remember_output(message.chat.id, sent.message_id)
+            if output_kind:
+                self.store.remember_output(message.chat.id, output_kind, sent.message_id)
             return sent
 
     async def help(self, message: Message):
-        await self.respond(message, HELP)
+        await self.respond(message, HELP, output_kind="help")
 
     async def old_button(self, query: CallbackQuery):
         await query.answer('Это кнопка прошлой викторины. Откройте новое приглашение /quiz.', show_alert=True)
@@ -83,7 +84,7 @@ class Quiz:
             await self.respond(message, f'🎭 {TITLE}\nДве игры: «Закончи фразу» и «Кто это сказал?» — по 10 вопросов.\n'
                                'Четыре варианта, без таймера. Всё прохождение — в личке.\n'
                                'По одной попытке в каждой игре. Раздельные рейтинги — /top.\n'
-                               'Нажмите кнопку, затем «Начать».', reply_markup=self.invitation(group))
+                               'Нажмите кнопку, затем «Начать».', reply_markup=self.invitation(group), output_kind='quiz')
             return
         if message.chat.type != ChatType.PRIVATE or not message.from_user:
             return
@@ -244,11 +245,11 @@ class Quiz:
         if not group:
             await self.respond(message, 'Сначала откройте ссылку /quiz из группы.')
             return
-        await self.respond(message, f'🏆 {escape(group["title"])}\n\n' + '\n\n'.join(f'<b>{game["title"]}</b>\n' + self.table(group['chat_id'], game['id']) for game in GAMES.values()))
+        await self.respond(message, f'🏆 {escape(group["title"])}\n\n' + '\n\n'.join(f'<b>{game["title"]}</b>\n' + self.table(group['chat_id'], game['id']) for game in GAMES.values()), output_kind='top')
 
     async def stats(self, message: Message):
         if message.chat.type != ChatType.PRIVATE:
-            await self.respond(message, 'Личная статистика доступна через /stats в личном чате с ботом.')
+            await self.respond(message, 'Личная статистика доступна через /stats в личном чате с ботом.', output_kind='stats')
             return
         group = self.selected_group(message)
         if not group:
