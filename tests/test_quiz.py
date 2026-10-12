@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from bot import Quiz
 from config import database_path
-from questions import QUESTIONS, PARTICIPANTS, display_name
+from questions import QUESTIONS, PARTICIPANTS, display_name, QUIZ_ID, AUTHOR_QUIZ_ID, AUTHOR_QUESTIONS, GAMES
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import DeleteMessage
 from storage import Storage
@@ -98,8 +98,9 @@ class QuizTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('https://t.me/test_bot?start=g_', url)
         personal = self.message(user=9, text='/start g_' + self.group['token'])
         await self.quiz.start(personal)
-        self.assertIsNotNone(self.db.attempt(-1, 9))
-        self.assertEqual(personal.answer.await_count, 2)
+        self.assertIsNone(self.db.attempt(-1, 9))
+        self.assertEqual(personal.answer.await_count, 1)
+        self.assertEqual(len(personal.answer.call_args.kwargs['reply_markup'].inline_keyboard), 2)
         invalid = self.message(user=10, text='/start g_unknown')
         await self.quiz.start(invalid)
         self.assertIsNone(self.db.attempt(-1, 10))
@@ -182,6 +183,104 @@ class QuizTests(unittest.IsolatedAsyncioTestCase):
         for q in json.loads(self.attempt['questions']):
             self.assertEqual(len(set(q['options'])), 4)
             self.assertIn(q['options'][int(q['answer'])], q['quote'])
+
+    def menu_query(self, key='author', token=None, user=7):
+        return NS(data=f'game:{token or self.group["token"]}:{key}',
+                  from_user=NS(id=user, full_name='Alice'), message=self.message(user), answer=AsyncMock())
+
+    async def test_two_games_switch_and_independent_attempts(self):
+        await self.quiz.callback(self.callback())
+        q = self.menu_query()
+        await self.quiz.menu_callback(q)
+        author = self.db.attempt(-1, 7, AUTHOR_QUIZ_ID)
+        self.assertNotEqual(author['id'], self.attempt['id'])
+        self.assertEqual(self.db.score(author['id'])['answers'], 0)
+        await self.quiz.menu_callback(self.menu_query('finish'))
+        self.assertEqual(self.db.score(self.attempt['id'])['points'], 1)
+        self.assertEqual(self.db.attempt(-1, 7)['questions'], self.attempt['questions'])
+        await self.quiz.menu_callback(self.menu_query())
+        self.assertEqual(self.db.attempt(-1, 7, AUTHOR_QUIZ_ID)['id'], author['id'])
+        text, keyboard = self.quiz.render(author)
+        self.assertIn('Кто это сказал?', text)
+        self.assertNotIn('Правильный вариант', text)
+        self.assertNotIn(json.loads(author['questions'])[0]['date'], text)
+        self.assertIn('menu:', keyboard.inline_keyboard[-1][0].callback_data)
+
+    async def test_menu_is_bound_to_group_and_rejects_bad_buttons(self):
+        other = self.db.group(-2, 'Other')
+        self.db.set_context(-2, 7)
+        await self.quiz.menu_callback(self.menu_query())
+        self.assertIsNotNone(self.db.attempt(-1, 7, AUTHOR_QUIZ_ID))
+        self.assertIsNone(self.db.attempt(-2, 7, AUTHOR_QUIZ_ID))
+        self.assertEqual(self.db.context(7)['chat_id'], -1)
+        for data in ('game:missing:author', f'game:{other["token"]}:unknown', 'menu:', 'game'):
+            q = self.menu_query(); q.data = data
+            await self.quiz.menu_callback(q)
+            q.message.edit_text.assert_not_called()
+        q = self.menu_query(); q.message.chat.id = 99
+        await self.quiz.menu_callback(q)
+        q.message.edit_text.assert_not_called()
+
+    async def test_author_finished_ranking_stats_and_restart(self):
+        await self.quiz.menu_callback(self.menu_query())
+        author = self.db.attempt(-1, 7, AUTHOR_QUIZ_ID)
+        questions = json.loads(author['questions'])
+        for pos, question in enumerate(questions):
+            q = self.callback(pos, question['answer'])
+            q.data = f'q:{author["id"]}:{pos}:{question["answer"]}'
+            await self.quiz.callback(q)
+            await self.quiz.callback(q)
+            if pos < len(questions)-1:
+                self.assertEqual(self.db.ranking(-1, AUTHOR_QUIZ_ID), [])
+                q.data = f'q:{author["id"]}:{pos}:next'
+                await self.quiz.callback(q)
+        self.assertEqual(self.db.score(author['id'])['points'], 10)
+        self.assertEqual(self.db.ranking(-1), [])
+        self.assertEqual(self.db.ranking(-1, AUTHOR_QUIZ_ID)[0]['points'], 10)
+        text, keyboard = self.quiz.render(self.db.get(author['id'], 7))
+        self.assertIn('10/10', text)
+        self.assertTrue(keyboard.inline_keyboard[0][0].callback_data.startswith('menu:'))
+        self.db.close(); self.db = Storage(self.path)
+        self.quiz = Quiz(self.bot, self.db, 'test_bot')
+        self.assertEqual(self.db.start(-1, 7, 'Alice', AUTHOR_QUIZ_ID)['id'], author['id'])
+        self.assertTrue(self.db.get(author['id'], 7)['finished'])
+        for handler in (self.quiz.top, self.quiz.stats):
+            msg = self.message()
+            await handler(msg)
+            text = msg.answer.call_args.args[0]
+            self.assertIn('Кто это сказал?', text)
+            self.assertIn('Закончи фразу', text)
+        self.bot.send_message.assert_not_called()
+
+    async def test_nine_point_completion_result_preserved(self):
+        questions = json.loads(self.attempt['questions'])
+        for pos, question in enumerate(questions):
+            choice = question['answer'] if pos else str((int(question['answer'])+1)%4)
+            self.db.answer(self.attempt['id'], 7, pos, choice)
+            self.db.advance(self.attempt['id'], 7, pos)
+        self.db.close(); self.db = Storage(self.path)
+        self.quiz = Quiz(self.bot, self.db, 'test_bot')
+        await self.quiz.menu_callback(self.menu_query())
+        await self.quiz.menu_callback(self.menu_query('finish'))
+        old = self.db.attempt(-1, 7)
+        self.assertEqual(old['id'], self.attempt['id'])
+        self.assertEqual(old['questions'], self.attempt['questions'])
+        self.assertEqual(old['quiz_id'], 'kolyandia-2026-10-v1')
+        self.assertTrue(old['finished'])
+        self.assertEqual(self.db.ranking(-1)[0]['points'], 9)
+        self.assertEqual(self.db.score(old['id'])['answers'], 10)
+
+    async def test_author_data_and_callback_lengths(self):
+        self.assertFalse({q['source_id'] for q in QUESTIONS} & {q['source_id'] for q in AUTHOR_QUESTIONS})
+        for q in AUTHOR_QUESTIONS:
+            self.assertEqual(q['name'], q['quote'])
+            self.assertEqual(q['options'][int(q['answer'])], q['author'])
+            self.assertTrue(set(q['options']).issubset(set(PARTICIPANTS.values())))
+        msg = self.message()
+        await self.quiz.show_menu(msg, self.group, 7)
+        for row in msg.answer.call_args.kwargs['reply_markup'].inline_keyboard:
+            for button in row:
+                self.assertLessEqual(len(button.callback_data.encode()), 64)
 
 if __name__ == '__main__':
     unittest.main()
