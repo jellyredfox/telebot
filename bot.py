@@ -14,15 +14,15 @@ from aiogram.filters import Command
 from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
-from questions import TITLE, QUESTIONS, display_name
+from questions import TITLE, QUIZ_ID, GAMES, GAMES_BY_ID, display_name
 from config import database_path
 from storage import Storage
 
 HELP = ('🎭 Я такого не говорил\n'
         'В группе: /quiz — ссылка на личное прохождение; /top — результаты завершивших.\n'
-        'В личном чате: /quiz — продолжить, /stats — ваш прогресс, /top — рейтинг выбранной группы.\n\n'
+        'В личном чате: /quiz — выбрать игру или продолжить, /stats — ваш прогресс, /top — рейтинг выбранной группы.\n\n'
         'Без таймера. Один ответ на вопрос, 1 очко за правильный ответ. '
-        'Одна попытка на участника в каждой группе. Можно вернуться в любое время. '
+        'Одна попытка в каждой из двух игр на участника в группе. Рейтинги игр раздельные. Можно вернуться в любое время. '
         'Результат попадает в рейтинг только после последнего ответа.')
 
 class Quiz:
@@ -36,6 +36,7 @@ class Quiz:
         self.router.message.register(self.help, Command('help'))
         self.router.message.register(self.top, Command('top'))
         self.router.message.register(self.stats, Command('stats'))
+        self.router.callback_query.register(self.menu_callback, F.data.startswith('menu:') | F.data.startswith('game:'))
         self.router.callback_query.register(self.callback, F.data.startswith('q:'))
         self.router.callback_query.register(self.old_button, F.data.startswith('a:') | F.data.startswith('p:'))
 
@@ -79,9 +80,9 @@ class Quiz:
     async def quiz(self, message: Message):
         if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
             group = self.store.group(message.chat.id, message.chat.title or 'Группа')
-            await self.respond(message, f'🎭 {TITLE}\n{len(QUESTIONS)} вопросов: угадайте продолжение настоящих фраз из чата.\n'
+            await self.respond(message, f'🎭 {TITLE}\nДве игры: «Закончи фразу» и «Кто это сказал?» — по 10 вопросов.\n'
                                'Четыре варианта, без таймера. Всё прохождение — в личке.\n'
-                               'Одна попытка. Результаты завершивших — /top.\n'
+                               'По одной попытке в каждой игре. Раздельные рейтинги — /top.\n'
                                'Нажмите кнопку, затем «Начать».', reply_markup=self.invitation(group))
             return
         if message.chat.type != ChatType.PRIVATE or not message.from_user:
@@ -91,8 +92,7 @@ class Quiz:
             if not group:
                 await self.respond(message, 'Откройте ссылку из вашей группы: там нужно отправить /quiz.')
                 return
-            attempt = self.store.start(group['chat_id'], message.from_user.id, message.from_user.full_name)
-            await self.show(message, attempt)
+            await self.show_menu(message, group, message.from_user.id)
 
     async def start(self, message: Message):
         if message.chat.type != ChatType.PRIVATE or not message.from_user:
@@ -108,12 +108,60 @@ class Quiz:
             await self.respond(message, 'Ссылка не найдена. Получите новую командой /quiz в группе.')
             return
         async with self.locks[message.from_user.id]:
-            attempt = self.store.start(group['chat_id'], message.from_user.id, message.from_user.full_name)
-            await self.respond(message, f'Викторина группы «{escape(group["title"])}».\n\n' + HELP)
-            await self.show(message, attempt)
+            self.store.set_context(group['chat_id'], message.from_user.id)
+            await self.show_menu(message, group, message.from_user.id)
 
-    def table(self, chat_id):
-        rows = self.store.ranking(chat_id)
+    def menu_button(self, chat_id):
+        token = self.store.db.execute('SELECT token FROM quiz_groups WHERE chat_id=?', (chat_id,)).fetchone()[0]
+        return [InlineKeyboardButton(text='← Выбрать игру', callback_data=f'menu:{token}')]
+
+    async def show_menu(self, message, group, user_id, edit=False):
+        text = f'🎭 {TITLE}\nГруппа «{escape(group["title"])}»\n\nВыберите игру:\n'
+        buttons = []
+        for key, game in GAMES.items():
+            attempt = self.store.attempt(group['chat_id'], user_id, game['id'])
+            state = 'Начать'
+            if attempt:
+                score = self.store.score(attempt['id'])
+                count = len(json.loads(attempt['questions']))
+                state = f'Итог {score["points"]}/{count}' if attempt['finished'] else f'Продолжить · {score["answers"]}/{count}'
+            text += f'\n<b>{game["title"]}</b> — {state.lower()}'
+            buttons.append([InlineKeyboardButton(text=f'{game["title"]} · {state}', callback_data=f'game:{group["token"]}:{key}')])
+        text += '\n\nБез таймера. По одной попытке на игру. Результаты и рейтинги раздельные. Можно переключаться и продолжать позже.'
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        if edit:
+            try:
+                await message.edit_text(text, reply_markup=markup)
+                return
+            except TelegramBadRequest as exc:
+                if 'message is not modified' in str(exc).lower():
+                    return
+        await self.respond(message, text, reply_markup=markup)
+
+    async def menu_callback(self, query: CallbackQuery):
+        if not query.message or query.message.chat.type != ChatType.PRIVATE or query.message.chat.id != query.from_user.id:
+            await query.answer('Откройте игру в личном чате.', show_alert=True)
+            return
+        parts = (query.data or '').split(':')
+        valid = ((len(parts) == 2 and parts[0] == 'menu') or
+                 (len(parts) == 3 and parts[0] == 'game' and parts[2] in GAMES))
+        group = self.store.by_token(parts[1]) if valid else None
+        if not group:
+            await query.answer('Получите приглашение командой /quiz в группе.')
+            return
+        async with self.locks[query.from_user.id]:
+            self.store.set_context(group['chat_id'], query.from_user.id)
+            with contextlib.suppress(TelegramBadRequest):
+                await query.answer()
+            if parts[0] == 'menu':
+                await self.show_menu(query.message, group, query.from_user.id, edit=True)
+            else:
+                attempt = self.store.start(group['chat_id'], query.from_user.id,
+                                           query.from_user.full_name, GAMES[parts[2]]['id'])
+                await self.show(query.message, attempt, edit=True)
+
+    def table(self, chat_id, quiz_id=QUIZ_ID):
+        rows = self.store.ranking(chat_id, quiz_id)
         if not rows:
             return 'Пока никто не завершил викторину.'
         lines, place, previous = [], 0, None
@@ -131,21 +179,23 @@ class Quiz:
         question = questions[pos]
         answer = self.store.answer_at(attempt['id'], pos)
         title = self.store.db.execute('SELECT title FROM quiz_groups WHERE chat_id=?', (attempt['chat_id'],)).fetchone()[0]
-        text = f'<b>{escape(title)} · {pos + 1}/{len(questions)}</b>\n<b>{escape(question["name"])}</b>\n'
+        game = GAMES_BY_ID[attempt['quiz_id']]
+        text = f'<b>{escape(title)} · {escape(game["title"])} · {pos + 1}/{len(questions)}</b>\n<b>{escape(question["name"])}</b>\n'
         if answer:
             text += ('✅ Верно! +1 очко.\n' if answer['correct'] else 'Неверно. +0 очков.\n')
             text += f'Правильный вариант: {escape(question["options"][int(question["answer"])])}\n\n'
             text += f'«{escape(question["quote"])}»\n— {escape(question["author"])}, {question["date"]}'
             if attempt['finished']:
                 score = self.store.score(attempt['id'])['points']
-                text += f'\n\n🏁 Ваш результат: {score}/{len(questions)}.\n🏆 Рейтинг группы\n' + self.table(attempt['chat_id'])
-                return text, None
+                text += f'\n\n🏁 Ваш результат: {score}/{len(questions)}.\n🏆 Рейтинг группы\n' + self.table(attempt['chat_id'], attempt['quiz_id'])
+                return text, InlineKeyboardMarkup(inline_keyboard=[self.menu_button(attempt['chat_id'])])
             buttons = [[InlineKeyboardButton(text='Следующий вопрос →', callback_data=f'q:{attempt["id"]}:{pos}:next')]]
         else:
             text += '\n' + '\n\n'.join(f'{i + 1}. {escape(option)}' for i, option in enumerate(question['options']))
             text += '\n\nВыберите номер. Время не ограничено.'
             buttons = [[InlineKeyboardButton(text=str(choice + 1), callback_data=f'q:{attempt["id"]}:{pos}:{choice}')
                         for choice in range(4)]]
+        buttons.append(self.menu_button(attempt['chat_id']))
         return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
     async def show(self, message, attempt, edit=False):
@@ -194,21 +244,29 @@ class Quiz:
         if not group:
             await self.respond(message, 'Сначала откройте ссылку /quiz из группы.')
             return
-        await self.respond(message, f'🏆 {escape(group["title"])}\n' + self.table(group['chat_id']))
+        await self.respond(message, f'🏆 {escape(group["title"])}\n\n' + '\n\n'.join(f'<b>{game["title"]}</b>\n' + self.table(group['chat_id'], game['id']) for game in GAMES.values()))
 
     async def stats(self, message: Message):
         if message.chat.type != ChatType.PRIVATE:
             await self.respond(message, 'Личная статистика доступна через /stats в личном чате с ботом.')
             return
         group = self.selected_group(message)
-        attempt = self.store.attempt(group['chat_id'], message.from_user.id) if group else None
-        if not attempt:
+        if not group:
             await self.respond(message, 'Сначала откройте ссылку /quiz из группы.')
             return
-        score = self.store.score(attempt['id'])
-        count = len(json.loads(attempt['questions']))
-        state = 'Завершено, результат в рейтинге.' if attempt['finished'] else 'В процессе; в рейтинге пока не учитывается. /quiz — продолжить.'
-        await self.respond(message, f'{escape(group["title"])}\nОтветов: {score["answers"]}/{count}\nОчки: {score["points"]}\n{state}')
+        lines = [escape(group['title'])]
+        for game in GAMES.values():
+            attempt = self.store.attempt(group['chat_id'], message.from_user.id, game['id'])
+            lines.append(f'\n<b>{game["title"]}</b>')
+            if not attempt:
+                lines.append('Ещё не начато.')
+                continue
+            score = self.store.score(attempt['id'])
+            count = len(json.loads(attempt['questions']))
+            state = 'Завершено, результат в рейтинге.' if attempt['finished'] else 'В процессе.'
+            lines.append(f'Ответов: {score["answers"]}/{count} · Очки: {score["points"]}\n{state}')
+        lines.append('\n/quiz — выбрать игру или продолжить.')
+        await self.respond(message, '\n'.join(lines))
 
 async def main():
     load_dotenv()

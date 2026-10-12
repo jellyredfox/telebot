@@ -3,5 +3,5 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY bot.py storage.py questions.py config.py quiz-data.json participants.json ./
+COPY bot.py storage.py questions.py config.py quiz-data.json author-data.json participants.json ./
 CMD ["python", "bot.py"]

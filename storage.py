@@ -5,7 +5,7 @@ import secrets
 import sqlite3
 from pathlib import Path
 
-from questions import QUESTIONS, QUIZ_ID, display_name
+from questions import QUIZ_ID, GAMES_BY_ID, display_name
 
 class Storage:
     def __init__(self, path):
@@ -46,9 +46,14 @@ class Storage:
     def context(self, user_id):
         return self.db.execute('SELECT g.* FROM quiz_groups g JOIN private_context c USING(chat_id) WHERE c.user_id=?', (user_id,)).fetchone()
 
-    def start(self, chat_id, user_id, name):
+    def set_context(self, chat_id, user_id):
+        with self.db:
+            self.db.execute('INSERT INTO private_context VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id', (user_id, chat_id))
+
+    def start(self, chat_id, user_id, name, quiz_id=QUIZ_ID):
+        source = GAMES_BY_ID[quiz_id]['questions']
         snapshot = []
-        for original in random.sample(QUESTIONS, len(QUESTIONS)):
+        for original in random.sample(source, len(source)):
             q = dict(original)
             correct = q['options'][int(q['answer'])]
             q['options'] = random.sample(q['options'], len(q['options']))
@@ -58,15 +63,16 @@ class Storage:
         name = display_name(user_id, name)
         with self.db:
             self.db.execute('INSERT INTO pearl_attempts(chat_id,user_id,name,questions,quiz_id) VALUES (?,?,?,?,?) ON CONFLICT(chat_id,user_id,quiz_id) DO UPDATE SET name=excluded.name',
-                            (chat_id, user_id, name, questions, QUIZ_ID))
+                            (chat_id, user_id, name, questions, quiz_id))
             self.db.execute('INSERT INTO private_context VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id', (user_id, chat_id))
-        return self.attempt(chat_id, user_id)
+        return self.attempt(chat_id, user_id, quiz_id)
 
-    def attempt(self, chat_id, user_id):
-        return self.db.execute('SELECT * FROM pearl_attempts WHERE chat_id=? AND user_id=? AND quiz_id=?', (chat_id, user_id, QUIZ_ID)).fetchone()
+    def attempt(self, chat_id, user_id, quiz_id=QUIZ_ID):
+        return self.db.execute('SELECT * FROM pearl_attempts WHERE chat_id=? AND user_id=? AND quiz_id=?', (chat_id, user_id, quiz_id)).fetchone()
 
     def get(self, attempt_id, user_id):
-        return self.db.execute('SELECT * FROM pearl_attempts WHERE id=? AND user_id=? AND quiz_id=?', (attempt_id, user_id, QUIZ_ID)).fetchone()
+        row = self.db.execute('SELECT * FROM pearl_attempts WHERE id=? AND user_id=?', (attempt_id, user_id)).fetchone()
+        return row if row and row['quiz_id'] in GAMES_BY_ID else None
 
     def answer_at(self, attempt_id, position):
         return self.db.execute('SELECT * FROM pearl_answers WHERE attempt_id=? AND position=?', (attempt_id, position)).fetchone()
@@ -95,11 +101,11 @@ class Storage:
     def score(self, attempt_id):
         return self.db.execute('SELECT COALESCE(SUM(correct),0) AS points, COUNT(*) AS answers FROM pearl_answers WHERE attempt_id=?', (attempt_id,)).fetchone()
 
-    def ranking(self, chat_id):
+    def ranking(self, chat_id, quiz_id=QUIZ_ID):
         return self.db.execute('''SELECT p.user_id, p.name, SUM(a.correct) AS points
             FROM pearl_attempts p JOIN pearl_answers a ON a.attempt_id=p.id
             WHERE p.chat_id=? AND p.quiz_id=? AND p.finished=1 GROUP BY p.id
-            ORDER BY points DESC, p.user_id ASC''', (chat_id, QUIZ_ID)).fetchall()
+            ORDER BY points DESC, p.user_id ASC''', (chat_id, quiz_id)).fetchall()
 
     def previous_output(self, chat_id):
         row = self.db.execute('SELECT message_id FROM group_output WHERE chat_id=?', (chat_id,)).fetchone()

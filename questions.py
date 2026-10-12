@@ -1,15 +1,23 @@
-"""Private quiz content. Do not open quiz-data.json before playing if avoiding spoilers."""
 import json
 from pathlib import Path
 
-QUIZ_ID = 'kolyandia-2026-10-v1'
-TITLE = 'Я такого не говорил'
-QUESTIONS = json.loads(Path(__file__).with_name('quiz-data.json').read_text(encoding='utf-8'))
-PARTICIPANTS = json.loads(Path(__file__).with_name('participants.json').read_text(encoding='utf-8'))
+ROOT = Path(__file__).parent
+QUIZ_ID = 'kolyandia-2026-10-v1'  # Keep: existing scores and attempts use this ID.
+AUTHOR_QUIZ_ID = 'kolyandia-authors-2026-10-v1'
+TITLE = 'Я такого не говорил!'
+QUESTIONS = json.loads((ROOT / 'quiz-data.json').read_text(encoding='utf-8'))
+AUTHOR_QUESTIONS = json.loads((ROOT / 'author-data.json').read_text(encoding='utf-8'))
+PARTICIPANTS = json.loads((ROOT / 'participants.json').read_text(encoding='utf-8'))
+GAMES = {
+    'finish': {'id': QUIZ_ID, 'title': 'Закончи фразу', 'questions': QUESTIONS},
+    'author': {'id': AUTHOR_QUIZ_ID, 'title': 'Кто это сказал?', 'questions': AUTHOR_QUESTIONS},
+}
+GAMES_BY_ID = {game['id']: game for game in GAMES.values()}
 
 def display_name(user_id, fallback):
     return PARTICIPANTS.get(str(user_id), fallback)
 
-for question in QUESTIONS:
-    assert len(question['options']) == len(set(question['options'])) == 4
-    assert question['answer'] in ('0', '1', '2', '3')
+for game in GAMES.values():
+    for question in game['questions']:
+        assert len(question['options']) == len(set(question['options'])) == 4
+        assert question['answer'] in ('0', '1', '2', '3')
