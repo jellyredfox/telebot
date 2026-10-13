@@ -22,7 +22,7 @@ HELP = ('🎭 Я такого не говорил\n'
         'В группе: /quiz — ссылка на личное прохождение; /top — результаты завершивших.\n'
         'В личном чате: /quiz — выбрать игру или продолжить, /stats — ваш прогресс, /top — рейтинг выбранной группы.\n\n'
         'Без таймера. Один ответ на вопрос, 1 очко за правильный ответ. '
-        'Одна попытка в каждой из двух игр на участника в группе. Рейтинги игр раздельные. Можно вернуться в любое время. '
+        'Одна попытка на каждый выпуск в группе. Рейтинги выпусков раздельные. Можно вернуться в любое время. '
         'Результат попадает в рейтинг только после последнего ответа.')
 
 class Quiz:
@@ -81,9 +81,9 @@ class Quiz:
     async def quiz(self, message: Message):
         if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
             group = self.store.group(message.chat.id, message.chat.title or 'Группа')
-            await self.respond(message, f'🎭 {TITLE}\nДве игры: «Закончи фразу» и «Кто это сказал?» — по 10 вопросов.\n'
+            await self.respond(message, f'🎭 {TITLE}\n«Закончи фразу» и два выпуска «Кто это сказал?» — по 10 вопросов.\n'
                                'Четыре варианта, без таймера. Всё прохождение — в личке.\n'
-                               'По одной попытке в каждой игре. Раздельные рейтинги — /top.\n'
+                               'По одной попытке в каждом выпуске. Раздельные рейтинги — /top.\n'
                                'Нажмите кнопку, затем «Начать».', reply_markup=self.invitation(group), output_kind='quiz')
             return
         if message.chat.type != ChatType.PRIVATE or not message.from_user:
@@ -117,7 +117,7 @@ class Quiz:
         return [InlineKeyboardButton(text='← Выбрать игру', callback_data=f'menu:{token}')]
 
     async def show_menu(self, message, group, user_id, edit=False):
-        text = f'🎭 {TITLE}\nГруппа «{escape(group["title"])}»\n\nВыберите игру:\n'
+        text = f'🎭 {TITLE}\nГруппа «{escape(group["title"])}»\n\nВыберите игру и выпуск:\n'
         buttons = []
         for key, game in GAMES.items():
             attempt = self.store.attempt(group['chat_id'], user_id, game['id'])
@@ -128,7 +128,7 @@ class Quiz:
                 state = f'Итог {score["points"]}/{count}' if attempt['finished'] else f'Продолжить · {score["answers"]}/{count}'
             text += f'\n<b>{game["title"]}</b> — {state.lower()}'
             buttons.append([InlineKeyboardButton(text=f'{game["title"]} · {state}', callback_data=f'game:{group["token"]}:{key}')])
-        text += '\n\nБез таймера. По одной попытке на игру. Результаты и рейтинги раздельные. Можно переключаться и продолжать позже.'
+        text += '\n\nБез таймера. По одной попытке на выпуск. Результаты и рейтинги раздельные. Можно переключаться и продолжать позже.'
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
         if edit:
             try:

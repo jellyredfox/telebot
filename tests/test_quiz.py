@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from bot import Quiz
 from config import database_path
-from questions import QUESTIONS, PARTICIPANTS, display_name, QUIZ_ID, AUTHOR_QUIZ_ID, AUTHOR_QUESTIONS, GAMES
+from questions import QUESTIONS, PARTICIPANTS, display_name, QUIZ_ID, AUTHOR_QUIZ_ID, AUTHOR_QUESTIONS, GAMES, AUTHOR_V2_QUIZ_ID, AUTHOR_V2_QUESTIONS
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import DeleteMessage
 from storage import Storage
@@ -100,7 +100,7 @@ class QuizTests(unittest.IsolatedAsyncioTestCase):
         await self.quiz.start(personal)
         self.assertIsNone(self.db.attempt(-1, 9))
         self.assertEqual(personal.answer.await_count, 1)
-        self.assertEqual(len(personal.answer.call_args.kwargs['reply_markup'].inline_keyboard), 2)
+        self.assertEqual(len(personal.answer.call_args.kwargs['reply_markup'].inline_keyboard), 3)
         invalid = self.message(user=10, text='/start g_unknown')
         await self.quiz.start(invalid)
         self.assertIsNone(self.db.attempt(-1, 10))
@@ -327,6 +327,50 @@ class QuizTests(unittest.IsolatedAsyncioTestCase):
         for row in msg.answer.call_args.kwargs['reply_markup'].inline_keyboard:
             for button in row:
                 self.assertLessEqual(len(button.callback_data.encode()), 64)
+
+    async def test_second_edition_is_independent_and_survives_restart(self):
+        first = self.db.start(-1, 7, 'Alice', AUTHOR_QUIZ_ID)
+        self.db.answer(first['id'], 7, 0, json.loads(first['questions'])[0]['answer'])
+        await self.quiz.menu_callback(self.menu_query('author2'))
+        second = self.db.attempt(-1, 7, AUTHOR_V2_QUIZ_ID)
+        self.assertNotEqual(first['id'], second['id'])
+        self.assertEqual(self.db.score(second['id'])['answers'], 0)
+        for pos, question in enumerate(json.loads(second['questions'])):
+            self.assertTrue(self.db.answer(second['id'], 7, pos, question['answer']))
+            self.assertFalse(self.db.answer(second['id'], 7, pos, question['answer']))
+            self.db.advance(second['id'], 7, pos)
+        self.assertEqual(self.db.ranking(-1, AUTHOR_V2_QUIZ_ID)[0]['points'], 10)
+        self.assertEqual(self.db.ranking(-1, AUTHOR_QUIZ_ID), [])
+        self.db.close(); self.db = Storage(self.path)
+        self.quiz = Quiz(self.bot, self.db, 'test_bot')
+        await self.quiz.menu_callback(self.menu_query('author'))
+        self.assertEqual(self.db.attempt(-1, 7, AUTHOR_QUIZ_ID)['questions'], first['questions'])
+        self.assertEqual(self.db.score(first['id'])['points'], 1)
+        await self.quiz.menu_callback(self.menu_query('author2'))
+        self.assertEqual(self.db.attempt(-1, 7, AUTHOR_V2_QUIZ_ID)['id'], second['id'])
+        for handler in (self.quiz.top, self.quiz.stats, self.quiz.quiz):
+            msg = self.message()
+            await handler(msg)
+            text = msg.answer.call_args.args[0]
+            self.assertIn('Выпуск 1', text)
+            self.assertIn('Выпуск 2', text)
+        self.bot.send_message.assert_not_called()
+
+    async def test_second_edition_content_balance_and_no_repeats(self):
+        from collections import Counter
+        self.assertEqual(len(AUTHOR_V2_QUESTIONS), 10)
+        authors = Counter(q['author'] for q in AUTHOR_V2_QUESTIONS)
+        self.assertGreaterEqual(len(authors), 7)
+        self.assertLessEqual(max(authors.values()), 2)
+        old_ids = {q['source_id'] for q in QUESTIONS + AUTHOR_QUESTIONS}
+        self.assertFalse(old_ids & {q['source_id'] for q in AUTHOR_V2_QUESTIONS})
+        for q in AUTHOR_V2_QUESTIONS:
+            self.assertEqual(len(set(q['options'])), 4)
+            self.assertEqual(q['options'][int(q['answer'])], q['author'])
+            self.assertTrue(set(q['options']).issubset(set(PARTICIPANTS.values())))
+        appearances = Counter(name for q in AUTHOR_V2_QUESTIONS for name in q['options'])
+        self.assertEqual(set(appearances), set(PARTICIPANTS.values()))
+        self.assertLessEqual(max(appearances.values()), 5)
 
 if __name__ == '__main__':
     unittest.main()
