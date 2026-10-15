@@ -18,6 +18,11 @@ from questions import PARTICIPANTS, display_name
 
 SOURCE_CHAT_ID = -1001998359261
 TITLE = '🎠 Карусель Санька'
+EXCLUDED_AUTHOR_ID = 7306272727
+EXCLUDED_AUTHOR_NAME = 'Jelly Fox'
+SANYA_ID = 5992641519
+SANYA_ALIASES = (103295761, 8117717008)
+SANYA_NAMES = {'Саня', 'Санёк', 'Удалённый аккаунт'}
 TZ = ZoneInfo('Europe/Moscow')
 
 def cutoff(now=None):
@@ -56,14 +61,50 @@ class Carousel:
             PRIMARY KEY(chat_id,user_id));
         ''')
 
+        self.merge_sanya()
+
+    def merge_sanya(self):
+        """Normalize author identities, without changing player scores or seen IDs."""
+        with self.db:
+            self.db.execute('DELETE FROM carousel_authors WHERE user_id=?', (EXCLUDED_AUTHOR_ID,))
+            for uid in SANYA_ALIASES:
+                self.db.execute('UPDATE carousel_messages SET author_id=? WHERE author_id=?', (SANYA_ID,uid))
+                self.db.execute('DELETE FROM carousel_authors WHERE user_id=?', (uid,))
+            self.db.execute("INSERT INTO carousel_authors VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET name=excluded.name", (SANYA_ID,'Саня'))
+            for row in self.db.execute('SELECT * FROM carousel_sessions').fetchall():
+                q = json.loads(row['payload'])
+                original = json.dumps(q,ensure_ascii=False)
+                if q['author_id'] in (*SANYA_ALIASES, SANYA_ID):
+                    q['author_id'], q['author'] = SANYA_ID, 'Саня'
+                answer = int(q['answer'])
+                # Keep the correct slot and replace duplicate distractors.
+                options = ['Саня' if x in SANYA_NAMES else x for x in q['options']]
+                options[answer] = q['author']
+                used = {q['author']}
+                pool = sorted(set(self.author_names().values()) - set(options))
+                for index in range(len(options)):
+                    if index == answer:
+                        continue
+                    if options[index] in used or options[index] == EXCLUDED_AUTHOR_NAME:
+                        options[index] = random.choice(pool)
+                        pool.remove(options[index])
+                    used.add(options[index])
+                q['options'] = options
+                payload = json.dumps(q,ensure_ascii=False)
+                if payload != original:
+                    self.db.execute('UPDATE carousel_sessions SET payload=?,token=? WHERE chat_id=? AND user_id=?',
+                        (payload,secrets.token_urlsafe(9),row['chat_id'],row['user_id']))
+
     def author_names(self):
         names = dict(PARTICIPANTS)
         names.update({str(r['user_id']): r['name'] for r in self.db.execute('SELECT * FROM carousel_authors')})
+        names.pop(str(EXCLUDED_AUTHOR_ID), None)
         return names
 
     def ingest(self, chat_id, message_id, author_id, sent_at, text, allowed=True):
         if chat_id != SOURCE_CHAT_ID:
             return False
+        author_id = SANYA_ID if author_id in SANYA_ALIASES else author_id
         valid = allowed and str(author_id) in self.author_names() and acceptable(text)
         with self.db:
             if not valid:
@@ -87,6 +128,7 @@ class Carousel:
             authors = seed.execute('SELECT user_id,name FROM carousel_authors').fetchall() if seed.execute("SELECT 1 FROM sqlite_master WHERE name='carousel_authors'").fetchone() else []
         finally:
             seed.close()
+        authors = [(uid,name) for uid,name in authors if uid != EXCLUDED_AUTHOR_ID]
         names = self.author_names()
         names.update({str(uid): name for uid,name in authors})
         rows = [r for r in rows if r[0] == SOURCE_CHAT_ID and str(r[2]) in names and acceptable(r[4])]
@@ -94,6 +136,7 @@ class Carousel:
             self.db.executemany('INSERT INTO carousel_authors VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET name=excluded.name',authors)
             self.db.executemany('INSERT OR IGNORE INTO carousel_messages VALUES (?,?,?,?,?)',rows)
             self.db.execute('INSERT INTO carousel_imports VALUES (?)',(digest,))
+        self.merge_sanya()
         return len(rows)
 
     def session(self, chat_id, user_id):

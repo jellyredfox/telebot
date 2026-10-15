@@ -189,4 +189,73 @@ class CarouselTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.c.score(SOURCE_CHAT_ID,999999)['answers'],0)
         self.quiz.bot.get_chat_member.assert_not_called()
 
+    async def test_sanya_accounts_merge_preserves_progress_and_replaces_old_buttons(self):
+        from carousel import SANYA_ID, SANYA_ALIASES
+        self.seed(1)
+        row=self.c.draw(SOURCE_CHAT_ID,7,'Player',NOW)
+        q=json.loads(row['payload'])
+        q.update(author_id=SANYA_ALIASES[0],author='Удалённый аккаунт',
+                 options=['Саня','Удалённый аккаунт','Санёк','Вика'],answer='1')
+        with self.storage.db:
+            for alias,name in zip(SANYA_ALIASES,['Удалённый аккаунт','Санёк']):
+                self.storage.db.execute('INSERT INTO carousel_authors VALUES (?,?)',(alias,name))
+            self.storage.db.execute('UPDATE carousel_messages SET author_id=?',(SANYA_ALIASES[0],))
+            self.storage.db.execute('UPDATE carousel_sessions SET payload=?',(json.dumps(q,ensure_ascii=False),))
+            self.storage.db.execute('UPDATE carousel_stats SET answers=6,correct=4')
+        seen=[tuple(r) for r in self.storage.db.execute('SELECT * FROM carousel_seen')]
+        self.c=Carousel(self.storage.db)
+        after=self.c.session(SOURCE_CHAT_ID,7);new=json.loads(after['payload'])
+        self.assertEqual(new['author_id'],SANYA_ID)
+        self.assertEqual(new['options'][1],'Саня')
+        self.assertEqual(new['options'].count('Саня'),1)
+        self.assertEqual(len(set(new['options'])),4)
+        self.assertNotIn('Удалённый аккаунт',new['options'])
+        self.assertNotIn('Санёк',new['options'])
+        self.assertEqual(new['text'],q['text'])
+        self.assertNotEqual(row['token'],after['token'])
+        self.assertFalse(self.c.act(SOURCE_CHAT_ID,7,row['token'],'1',NOW))
+        self.assertEqual(self.c.score(SOURCE_CHAT_ID,7)['answers'],6)
+        self.assertEqual(self.c.score(SOURCE_CHAT_ID,7)['correct'],4)
+        self.assertEqual([tuple(r) for r in self.storage.db.execute('SELECT * FROM carousel_seen')],seen)
+        self.assertEqual(self.c.draw(SOURCE_CHAT_ID,7,'Player',NOW)['token'],after['token'])
+        self.c=Carousel(self.storage.db)
+        self.assertEqual(self.c.session(SOURCE_CHAT_ID,7)['token'],after['token'])
+        self.assertTrue(self.c.act(SOURCE_CHAT_ID,7,after['token'],'1',NOW))
+
+    async def test_expanded_seed_groups_sanya_before_author_sampling(self):
+        from carousel import SANYA_ID, SANYA_ALIASES
+        self.c.import_seed(Path(__file__).resolve().parents[1]/'carousel-seed.db')
+        names=self.c.author_names()
+        self.assertEqual(len(names),14)
+        self.assertTrue(all(str(uid) not in names for uid in SANYA_ALIASES))
+        self.assertEqual(self.storage.db.execute('SELECT COUNT(*) FROM carousel_messages WHERE author_id=?',(SANYA_ID,)).fetchone()[0],998)
+        self.assertEqual(self.storage.db.execute('SELECT COUNT(*) FROM carousel_messages').fetchone()[0],5353)
+        self.assertEqual(self.c.import_seed(Path(__file__).resolve().parents[1]/'carousel-seed.db'),0)
+
+    async def test_jelly_fox_removed_from_existing_question_without_reset(self):
+        self.seed(1)
+        row=self.c.draw(SOURCE_CHAT_ID,7,'Player',NOW)
+        q=json.loads(row['payload']);answer=int(q['answer'])
+        index=(answer+1)%4;q['options'][index]='Jelly Fox'
+        with self.storage.db:
+            self.storage.db.execute('INSERT INTO carousel_authors VALUES (?,?)',(7306272727,'Jelly Fox'))
+            self.storage.db.execute('UPDATE carousel_sessions SET payload=?',(json.dumps(q,ensure_ascii=False),))
+            self.storage.db.execute('UPDATE carousel_stats SET answers=6,correct=4')
+        seen=[tuple(r) for r in self.storage.db.execute('SELECT * FROM carousel_seen')]
+        self.c=Carousel(self.storage.db)
+        after=self.c.session(SOURCE_CHAT_ID,7);updated=json.loads(after['payload'])
+        self.assertNotIn('7306272727',self.c.author_names())
+        self.assertNotIn('Jelly Fox',updated['options'])
+        self.assertEqual(updated['text'],q['text'])
+        self.assertEqual(updated['options'][answer],q['options'][answer])
+        self.assertEqual(len(set(updated['options'])),4)
+        self.assertEqual(self.c.score(SOURCE_CHAT_ID,7)['answers'],6)
+        self.assertEqual(self.c.score(SOURCE_CHAT_ID,7)['correct'],4)
+        self.assertEqual([tuple(r) for r in self.storage.db.execute('SELECT * FROM carousel_seen')],seen)
+        self.assertFalse(self.c.act(SOURCE_CHAT_ID,7,row['token'],str(index),NOW))
+        self.c.import_seed(Path(__file__).resolve().parents[1]/'carousel-seed.db')
+        self.assertNotIn('Jelly Fox',self.c.author_names().values())
+        self.c=Carousel(self.storage.db)
+        self.assertEqual(self.c.session(SOURCE_CHAT_ID,7)['token'],after['token'])
+
 if __name__=='__main__':unittest.main()
