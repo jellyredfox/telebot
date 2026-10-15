@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 
 from questions import TITLE, QUIZ_ID, GAMES, GAMES_BY_ID, display_name
 from config import database_path
+from pathlib import Path
+from carousel import CarouselUI, SOURCE_CHAT_ID
 from storage import Storage
 
 HELP = ('🎭 Я такого не говорил\n'
@@ -23,19 +25,26 @@ HELP = ('🎭 Я такого не говорил\n'
         'В личном чате: /quiz — выбрать игру или продолжить, /stats — ваш прогресс, /top — рейтинг выбранной группы.\n\n'
         'Без таймера. Один ответ на вопрос, 1 очко за правильный ответ. '
         'Одна попытка на каждый выпуск в группе. Рейтинги выпусков раздельные. Можно вернуться в любое время. '
-        'Результат попадает в рейтинг только после последнего ответа.')
+        'Результат попадает в рейтинг только после последнего ответа.\n\n'
+        '🎠 Карусель Санька — без ограничения числа вопросов. Сообщения старше двух месяцев, '
+        '60–300 символов. Точность и место в отдельном рейтинге — после 20 ответов. '
+        'Пропусков нет: следующий вопрос после ответа. /carousel_top — рейтинг карусели. '
+        'Карусель работает только по загруженному архиву. Новые сообщения не записываются.')
 
 class Quiz:
     def __init__(self, bot, store, username):
         self.bot, self.store, self.username = bot, store, username
         self.locks = defaultdict(asyncio.Lock)
         self.group_locks = defaultdict(asyncio.Lock)
+        self.carousel = CarouselUI(self)
         self.router = Router()
         self.router.message.register(self.start, Command('start'))
         self.router.message.register(self.quiz, Command('quiz'))
         self.router.message.register(self.help, Command('help'))
         self.router.message.register(self.top, Command('top'))
         self.router.message.register(self.stats, Command('stats'))
+        self.router.message.register(self.carousel_top, Command('carousel_top'))
+        self.router.callback_query.register(self.carousel.callback, F.data.startswith('c:'))
         self.router.callback_query.register(self.menu_callback, F.data.startswith('menu:') | F.data.startswith('game:'))
         self.router.callback_query.register(self.callback, F.data.startswith('q:'))
         self.router.callback_query.register(self.old_button, F.data.startswith('a:') | F.data.startswith('p:'))
@@ -82,6 +91,7 @@ class Quiz:
         if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
             group = self.store.group(message.chat.id, message.chat.title or 'Группа')
             await self.respond(message, f'🎭 {TITLE}\n«Закончи фразу» и два выпуска «Кто это сказал?» — по 10 вопросов.\n'
+                               'Плюс 🎠 Карусель Санька — бесконечный режим в Коляндии.\n'
                                'Четыре варианта, без таймера. Всё прохождение — в личке.\n'
                                'По одной попытке в каждом выпуске. Раздельные рейтинги — /top.\n'
                                'Нажмите кнопку, затем «Начать».', reply_markup=self.invitation(group), output_kind='quiz')
@@ -128,6 +138,9 @@ class Quiz:
                 state = f'Итог {score["points"]}/{count}' if attempt['finished'] else f'Продолжить · {score["answers"]}/{count}'
             text += f'\n<b>{game["title"]}</b> — {state.lower()}'
             buttons.append([InlineKeyboardButton(text=f'{game["title"]} · {state}', callback_data=f'game:{group["token"]}:{key}')])
+        if group['chat_id'] == SOURCE_CHAT_ID:
+            buttons.append([InlineKeyboardButton(text='🎠 Карусель Санька', callback_data=f'c:{group["token"]}:open')])
+            text += '\n\n🎠 Карусель Санька — без конца, отдельный рейтинг по точности после 20 ответов. Следующий вопрос — после ответа.'
         text += '\n\nБез таймера. По одной попытке на выпуск. Результаты и рейтинги раздельные. Можно переключаться и продолжать позже.'
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
         if edit:
@@ -245,7 +258,14 @@ class Quiz:
         if not group:
             await self.respond(message, 'Сначала откройте ссылку /quiz из группы.')
             return
-        await self.respond(message, f'🏆 {escape(group["title"])}\n\n' + '\n\n'.join(f'<b>{game["title"]}</b>\n' + self.table(group['chat_id'], game['id']) for game in GAMES.values()), output_kind='top')
+        await self.respond(message, f'🏆 {escape(group["title"])}\n\n' + '\n\n'.join(f'<b>{game["title"]}</b>\n' + self.table(group['chat_id'], game['id']) for game in GAMES.values()) + ('\n\n🎠 Карусель Санька: /carousel_top' if group['chat_id']==SOURCE_CHAT_ID else ''), output_kind='top')
+
+    async def carousel_top(self, message: Message):
+        group = self.selected_group(message)
+        if not group or group['chat_id'] != SOURCE_CHAT_ID:
+            await self.respond(message, 'Карусель доступна только для Коляндии.')
+            return
+        await self.respond(message, self.carousel.store.table(group['chat_id']), output_kind='carousel_top')
 
     async def stats(self, message: Message):
         if message.chat.type != ChatType.PRIVATE:
@@ -266,6 +286,8 @@ class Quiz:
             count = len(json.loads(attempt['questions']))
             state = 'Завершено, результат в рейтинге.' if attempt['finished'] else 'В процессе.'
             lines.append(f'Ответов: {score["answers"]}/{count} · Очки: {score["points"]}\n{state}')
+        if group['chat_id'] == SOURCE_CHAT_ID:
+            lines.append('\n<b>🎠 Карусель Санька</b>\n' + self.carousel.store.stat_text(group['chat_id'],message.from_user.id))
         lines.append('\n/quiz — выбрать игру или продолжить.')
         await self.respond(message, '\n'.join(lines))
 
@@ -279,12 +301,14 @@ async def main():
     try:
         me = await bot.get_me()
         quiz = Quiz(bot, store, me.username)
+        imported = quiz.carousel.store.import_seed(Path(__file__).with_name('carousel-seed.db'))
+        logging.info('Carousel seed processed: %s rows', imported)
         dp = Dispatcher()
         dp.include_router(quiz.router)
         await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in [
             ('quiz', 'Начать или продолжить лично'), ('top', 'Рейтинг завершивших'),
-            ('stats', 'Мой прогресс'), ('help', 'Правила')]])
-        await bot.delete_webhook(drop_pending_updates=True)
+            ('stats', 'Мой прогресс'), ('carousel_top', 'Карусель: рейтинг по точности'), ('help', 'Правила')]])
+        await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot, close_bot_session=False)
     finally:
         store.close()
